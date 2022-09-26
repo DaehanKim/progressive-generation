@@ -1,26 +1,14 @@
 # Progressive Generation
 
-*Code to be further cleaned up soon...*
-
-This repo contains preliminary code of the following paper:
-
-[Progressive Generation of Long Text](https://arxiv.org/abs/2006.15720)  
-Bowen Tan, Zichao Yang, Maruan AI-Shedivat, Eric P. Xing, Zhiting Hu  
-pre-print, 2020
-
-The current code includes implementation of:
-- the progressive generation model
-- extensive evaluation metrics:
-  * Frechet Bert Distance ([Montahaei et al.](https://arxiv.org/abs/1904.03971))
-  * MS-Jaccard ([Montahaei et al.](https://arxiv.org/abs/1904.03971))
-  * Forward-Backward BLEU ([Shi et al.](https://arxiv.org/abs/1804.11258))
-  * TF-IDF Feature Distance (proposed in our paper)
 
 ## Requirements
 ```
-torch==1.2.0
+torch==1.10.0 # minimum version that supports A6000 gpu (use cu113 index)
 transformers==2.5.1
 fairseq==0.9.0
+fire
+omegaconf
+sklearn
 ```
 It needs at least 4 GPUs on your device if you want to finetune GPT2-Large baseline, otherwise 2 GPUs are enough.  
 
