@@ -7,7 +7,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 def get_texts(dataset):
     conds, texts = {}, {}
-    for split in ['train', 'dev', 'test']:
+    for split in ['train', 'valid', 'test']:
         print(f'loading {split} set...')
         examples = pickle.load(open(
             f'data/{dataset}/{split}.pickle', 'rb'))
@@ -64,7 +64,7 @@ def main(rate, dataset='wp'):
     pickle.dump(vocab, open(f'data/{dataset}/vocab_{rate}.pickle', 'wb'))
 
     vocab_dict = {word: 1 for word in vocab}
-    for split in ['train', 'dev', 'test']:
+    for split in ['train', 'valid', 'test']:
         print(f'extracting {split} set...')
 
         examples = []

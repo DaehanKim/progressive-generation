@@ -31,7 +31,7 @@ def main(dataset='wp', vocab='full', gpt2_type='gpt2', n_epochs=3):
 
     gpt2 = GPT2(gpt2_type=gpt2_type)
 
-    for split in ['train', 'dev']:
+    for split in ['train', 'valid']:
         conds, texts = load_data(dataset, split, vocab)
         gpt2.load_data(split=split, conds=conds, texts=texts)
 

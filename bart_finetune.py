@@ -45,7 +45,7 @@ def main(dataset='wp',
 
     bart = BART()
 
-    for split in ['train', 'dev']:
+    for split in ['train', 'valid']:
         src_texts = load_data(dataset, split, src_vocab, keep_condition=True)
         tgt_texts = load_data(dataset, split, tgt_vocab, keep_condition=False)
 
