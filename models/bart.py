@@ -102,12 +102,12 @@ class BART:
                 self.gen_log()
 
     def evaluate(self):
-        assert 'dev' in self._dataset
+        assert 'valid' in self._dataset
         self._model.split_to_gpus(1)
         self._model.eval()
 
         loss_list = []
-        for example in tqdm(self._dataset['dev'], desc='Evaluating'):
+        for example in tqdm(self._dataset['valid'], desc='Evaluating'):
             with torch.no_grad():
                 loss = self._get_seq2seq_loss(
                     src_text=example.src_text, tgt_text=example.tgt_text)
@@ -154,7 +154,7 @@ class BART:
         generation_file = open(
             f'{self._log_dir}/ckpt_gens/step{self._global_step}.txt', 'w')
 
-        for example in self._dataset['dev'][:10]:
+        for example in self._dataset['valid'][:10]:
             gen_text = self.generate(example.src_text, top_k=-1., top_p=0.95)
 
             print('SOURCE:\n', example.src_text, '\n', '-' * 50, '\n',
