@@ -3,7 +3,7 @@ import random
 from tqdm import tqdm, trange
 import os
 import nltk
-
+import wandb
 import torch
 
 from fairseq.sequence_generator import SequenceGenerator
@@ -11,6 +11,8 @@ from fairseq.sequence_generator import SequenceGenerator
 from transformers import AdamW, get_linear_schedule_with_warmup
 
 from .bart_utils import BARTModelWrapper
+from .bart_utils import try_wandb_log, try_wandb_add_example
+
 
 
 BART_MAX_LEN = 1024
@@ -26,6 +28,7 @@ class BART:
         self._optimizer = None
         self._lr_scheduler = None
         self._global_step = 0
+        self._ex_table = wandb.Table(columns=["step","src","gen","tgt"])
 
         self._dataset = {}
         self._log_dir = None
@@ -92,6 +95,7 @@ class BART:
                 loss = self._get_seq2seq_loss(
                     src_text=noised_src_text, tgt_text=example.tgt_text)
                 loss = loss / batch_size
+                try_wandb_log({"train/loss":loss.detach().item()}, step=self._global_step)
                 loss.backward()
 
             self._optimizer.step()
@@ -143,12 +147,14 @@ class BART:
 
         print(f'Global Step: {self._global_step}, Eval Loss: {eval_loss}',
               file=self._log_file)
+        
 
         if eval_loss < self._best_dev_loss:
             self._best_dev_loss = eval_loss
             self.save_model(f'{self._log_dir}/best_model.pt')
             print('Best Model Updated.', file=self._log_file)
 
+        try_wandb_log({"dev/loss":eval_loss, 'dev/best_loss':self._best_dev_loss}, step=self._global_step)
         self._log_file.flush()
 
         generation_file = open(
@@ -161,6 +167,7 @@ class BART:
                   'GENERATION:\n', gen_text, '\n', '-' * 50, '\n',
                   'TARGET:\n', example.tgt_text, '\n', '=' * 100, '\n\n\n',
                   file=generation_file)
+            try_wandb_add_example(self._ex_table, self._global_step,example.src_text, gen_text, example.tgt_text)
             generation_file.flush()
 
     def _get_seq2seq_loss(self, src_text, tgt_text):

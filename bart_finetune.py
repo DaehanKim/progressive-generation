@@ -1,6 +1,7 @@
 import os
 import fire
 import pickle
+import wandb
 
 from models.bart import BART
 
@@ -37,7 +38,10 @@ def load_data(dataset, split, vocab, keep_condition):
 def main(dataset='wp',
          src_vocab='null',
          tgt_vocab='full',
-         n_epochs=3):
+         n_epochs=3,
+         wandb_pj_name="progen"):
+    if wandb_pj_name:
+        wandb.init(entity='lucas01',project=wandb_pj_name, name=f"{dataset}-{src_vocab}-{tgt_vocab}")
 
     if os.path.exists(f'training_logs/bart_{dataset}_{src_vocab}-{tgt_vocab}'):
         print('Training path existed! Remove it if wanna re-train.')
@@ -61,7 +65,7 @@ def main(dataset='wp',
         adam_epsilon=ADAM_EPSILON)
 
     bart.create_training_log(
-        eval_steps=len(bart.dataset['train']) // BATCH_SIZE,
+        eval_steps=len(bart.dataset['train']) // BATCH_SIZE // 2, # 1 epoch에 evaluation set에 대해 2번 평가하기.
         label=f'bart_{dataset}_{src_vocab}-{tgt_vocab}')
 
     noise_vocab = get_vocab(dataset, src_vocab)

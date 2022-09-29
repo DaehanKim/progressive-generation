@@ -3,7 +3,8 @@ from torch import nn
 from torch.nn import functional as F
 
 import random
-
+import wandb
+from typing import Dict
 
 class BARTModelWrapper(nn.Module):
     def __init__(self):
@@ -295,3 +296,16 @@ def extract_features(
         x = self.project_out_dim(x)
 
     return x, {'attn': attn, 'inner_states': inner_states}
+
+
+def try_wandb_log(log_dict : Dict, step: int):
+    try:
+        wandb.log(log_dict, step=step)
+    except:
+        print("wandb is not initialized.. passing wandb logging")
+
+def try_wandb_add_example(table_obj : wandb.Table, step:int, src_text: str, gen_text:str, tgt_text:str):
+    try:
+        table_obj.add_data(step, src_text, gen_text, tgt_text)
+    except:
+        print("wandb is not initialized.. passing wandb logging")
