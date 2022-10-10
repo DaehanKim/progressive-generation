@@ -5,7 +5,7 @@ import wandb
 
 from models.bart import BART
 
-BATCH_SIZE = 5
+BATCH_SIZE = 16
 LR = 4e-5
 ADAM_EPSILON = 1e-8
 WEIGHT_DECAY = 0.
@@ -35,10 +35,10 @@ def load_data(dataset, split, vocab, keep_condition):
             return [example['extracted_text'] for example in examples]
 
 
-def main(dataset='wp',
-         src_vocab='null',
+def main(dataset='cnn',
+         src_vocab='0.25',
          tgt_vocab='full',
-         n_epochs=3,
+         n_epochs=10,
          wandb_pj_name="progen"):
     if wandb_pj_name:
         wandb.init(entity='lucas01',project=wandb_pj_name, name=f"{dataset}-{src_vocab}-{tgt_vocab}")
@@ -52,8 +52,8 @@ def main(dataset='wp',
     for split in ['train', 'valid']:
         src_texts = load_data(dataset, split, src_vocab, keep_condition=True)
         tgt_texts = load_data(dataset, split, tgt_vocab, keep_condition=False)
-
-        bart.load_data(set_type=split, src_texts=src_texts, tgt_texts=tgt_texts)
+        tgt_relevance = None
+        bart.load_data(set_type=split, src_texts=src_texts, tgt_texts=tgt_texts, tgt_relevances=tgt_relevance)
 
     train_steps = n_epochs * (len(bart.dataset['train']) // BATCH_SIZE + 1)
     warmup_steps = int(train_steps * WARMUP_PROPORTION)
@@ -70,7 +70,7 @@ def main(dataset='wp',
 
     noise_vocab = get_vocab(dataset, src_vocab)
     for epoch in range(n_epochs):
-        bart.train_epoch(batch_size=BATCH_SIZE, noise_vocab=noise_vocab)
+        bart.train_epoch(batch_size=BATCH_SIZE, noise_vocab=noise_vocab, tgt_vocab=tgt_vocab)
 
 
 if __name__ == '__main__':

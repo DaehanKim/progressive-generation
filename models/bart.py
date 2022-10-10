@@ -5,10 +5,12 @@ import os
 import nltk
 import wandb
 import torch
+from nltk.tokenize import sent_tokenize
 
 from fairseq.sequence_generator import SequenceGenerator
 
 from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import AutoModel, AutoTokenizer
 
 from .bart_utils import BARTModelWrapper
 from .bart_utils import try_wandb_log, try_wandb_add_example
@@ -21,10 +23,26 @@ BART_MAX_LEN = 1024
 TextPairData = namedtuple('TextPairData', ['src_text', 'tgt_text'])
 
 
+@torch.no_grad()
+def compute_sim_score(simcse_model, simcse_tokenizer, prompt, txt):
+    r_id = simcse_tokenizer.encode(prompt)
+    h_id = simcse_tokenizer.encode(txt)
+
+    r_id, h_id = r_id[:min(len(r_id), 512)], h_id[:min(len(h_id), 512)] # truncate to 512
+    ref_emb = simcse_model(input_ids = torch.LongTensor(r_id).view(1,-1).cuda())
+    hypo_emb = simcse_model(input_ids = torch.LongTensor(h_id).view(1,-1).cuda())
+    dotprod = (ref_emb.pooler_output * hypo_emb.pooler_output).sum(-1)
+    ref_norm = torch.norm(ref_emb.pooler_output, p=2)
+    hypo_norm = torch.norm(hypo_emb.pooler_output, p=2)
+    sim = dotprod / (ref_norm * hypo_norm) 
+    return sim.detach().cpu().item()
+
 class BART:
     def __init__(self):
         self._model = BARTModelWrapper()
-
+        # self._simcse = AutoModel.from_pretrained("")
+        self._simcse_model = AutoModel.from_pretrained("/princeton-nlp/unsup-simcse-roberta-large").cuda()
+        self._simcse_tokenizer = AutoTokenizer.from_pretrained("/princeton-nlp/unsup-simcse-roberta-large")
         self._optimizer = None
         self._lr_scheduler = None
         self._global_step = 0
@@ -68,16 +86,17 @@ class BART:
         self._model.load_state_dict(torch.load(path, map_location='cuda'))
         print(f'Model {path} loaded.')
 
-    def load_data(self, set_type, src_texts, tgt_texts):
+    def load_data(self, set_type, src_texts, tgt_texts, tgt_relevances):
         assert len(src_texts) == len(tgt_texts)
 
         self._dataset[set_type] = []
-        for src_text, tgt_text in zip(src_texts, tgt_texts):
+        for src_text, tgt_text, tgt_relevance in zip(src_texts, tgt_texts, tgt_relevances):
             self._dataset[set_type].append(TextPairData(
                 src_text=src_text, tgt_text=tgt_text))
 
-    def train_epoch(self, batch_size, noise_vocab):
+    def train_epoch(self, batch_size, noise_vocab, tgt_vocab):
         assert 'train' in self._dataset
+        self.get_seq2seq_loss = self._get_seq2seq_loss_w_rel if tgt_vocab == "full" else self._get_seq2seq_loss
 
         random.shuffle(self._dataset['train'])
         for i in trange(0, len(self._dataset['train']), batch_size,
@@ -92,7 +111,7 @@ class BART:
             for example in batch:
                 noised_src_text = self._add_noise(example.src_text, noise_vocab)
 
-                loss = self._get_seq2seq_loss(
+                loss = self.get_seq2seq_loss(
                     src_text=noised_src_text, tgt_text=example.tgt_text)
                 loss = loss / batch_size
                 try_wandb_log({"train/loss":loss.detach().item()}, step=self._global_step)
@@ -190,6 +209,63 @@ class BART:
             ignore_index=self._model.dictionary.pad())
         loss = criterion(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        return loss
+    
+    def _get_seq2seq_loss_w_rel(self, src_text , tgt_text, method:str = "direct"):
+        '''
+        tgt_relevance(Dict[str, float]) : 어디에서 어디까지(key, i.e. 0-14)가 relevance가 얼마인지(value) 정보를 가지고 있음.
+        method(str, either "direct" or "mmd") : 각 시퀀스의 relevance 정보를 이용해서 직접 최적화할지, 아니면 MMD로 loosly 최적화할지 선택. 
+        '''
+        # compute relevance of simcse on-the-fly
+        try:
+            prompt = src_text.split(' [SEP] ')[0]
+        except:
+            pass
+        tgt_relevance = {}
+        offset = 0
+        for sent in sent_tokenize(src_text): # sent_tokenize strips all \n\n
+            _len = self._model.encode(sent).size(-1)-2 # exclude </s> and <s>
+            if offset + _len > BART_MAX_LEN: break
+            tgt_relevance[f"{offset}-{offset+_len}"] = compute_sim_score(self._simcse_model,self._simcse_tokenizer, prompt, sent)
+            offset += (_len + 2) # +2 because of \n\n
+        
+
+        src_tokens = self._model.encode(src_text)[:BART_MAX_LEN].unsqueeze(0)
+        tgt_tokens = self._model.encode(tgt_text)[:BART_MAX_LEN].unsqueeze(0)
+
+        logits, extra = self._model(
+            src_tokens=src_tokens,
+            src_lengths=torch.tensor([src_tokens.shape[1]]),
+            prev_output_tokens=tgt_tokens)
+
+        tgt_tokens = tgt_tokens.to(logits.device)
+
+        # Shift so that tokens < n predict n
+        shift_logits = logits[:, :-1].contiguous()
+        shift_labels = tgt_tokens[:, 1:].contiguous()
+
+        # Flatten the tokens
+        criterion = torch.nn.CrossEntropyLoss(
+            ignore_index=self._model.dictionary.pad())
+        loss = criterion(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+        ### relevance distribution matching loss ###
+        assert method == "direct" 
+        z_p = extra["last_encoder_hidden"].mean(dim=1)
+        z_s = extra["last_decoder_hidden"]
+        rel_losses = []
+        # for idx, item in enumerate(tgt_relevance):
+        for pos, val in tgt_relevance.items():
+            start, end = map(int, pos.split("-"))
+            z_si = z_s[0, start:end].mean(dim=1)
+            val = float(val)
+            _mse_loss = (val - z_p.dot(z_si)/torch.norm(z_p)/torch.norm(z_si)).pow(2)
+            rel_losses.append(_mse_loss)
+        rel_losses = torch.cat(rel_losses).mean()
+
+        loss += 0.1*rel_losses
 
         return loss
 

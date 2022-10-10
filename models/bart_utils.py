@@ -52,6 +52,9 @@ class BARTModelWrapper(nn.Module):
             prev_output_tokens=prev_output_tokens.to(self._device_decoder),
             encoder_out=encoder_out,
             features_only=False)
+        
+        # add encoder hidden to output
+        extra.update({"last_encoder_hidden" : encoder_out["encoder_out"]})
 
         return x, extra
 
@@ -291,11 +294,12 @@ def extract_features(
 
     # T x B x C -> B x T x C
     x = x.transpose(0, 1)
+    decoder_last_hidden = x.clone()
 
     if self.project_out_dim is not None:
         x = self.project_out_dim(x)
 
-    return x, {'attn': attn, 'inner_states': inner_states}
+    return x, {'attn': attn, 'inner_states': inner_states, 'decoder_last_hidden' : decoder_last_hidden}
 
 
 def try_wandb_log(log_dict : Dict, step: int):
