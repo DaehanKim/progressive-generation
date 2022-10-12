@@ -34,6 +34,12 @@ def load_data(dataset, split, vocab, keep_condition):
         else:
             return [example['extracted_text'] for example in examples]
 
+def load_tgt_relevance(dataset, split, tgt_vocab):
+    examples = pickle.load(open(f'data/{dataset}/{split}.pickle', 'rb'))
+    if tgt_vocab == 'full':
+        return [example['tgt_relevance'] for example in examples]
+    return None
+
 
 def main(dataset='cnn',
          src_vocab='0.25',
@@ -52,8 +58,8 @@ def main(dataset='cnn',
     for split in ['train', 'valid']:
         src_texts = load_data(dataset, split, src_vocab, keep_condition=True)
         tgt_texts = load_data(dataset, split, tgt_vocab, keep_condition=False)
-        tgt_relevance = None
-        bart.load_data(set_type=split, src_texts=src_texts, tgt_texts=tgt_texts, tgt_relevances=tgt_relevance)
+        tgt_relevances = load_tgt_relevance(dataset, split, tgt_vocab)
+        bart.load_data(set_type=split, src_texts=src_texts, tgt_texts=tgt_texts, tgt_relevances=tgt_relevances)
 
     train_steps = n_epochs * (len(bart.dataset['train']) // BATCH_SIZE + 1)
     warmup_steps = int(train_steps * WARMUP_PROPORTION)

@@ -6,6 +6,7 @@ import nltk
 import wandb
 import torch
 from nltk.tokenize import sent_tokenize
+from collections import defaultdict
 
 from fairseq.sequence_generator import SequenceGenerator
 
@@ -18,9 +19,10 @@ from .bart_utils import try_wandb_log, try_wandb_add_example
 
 
 BART_MAX_LEN = 1024
+REL_MIXING_COEFF = 0.1
 
 
-TextPairData = namedtuple('TextPairData', ['src_text', 'tgt_text'])
+TextPairData = namedtuple('TextPairData', ['src_text', 'tgt_text', 'tgt_relevance'])
 
 
 @torch.no_grad()
@@ -40,9 +42,6 @@ def compute_sim_score(simcse_model, simcse_tokenizer, prompt, txt):
 class BART:
     def __init__(self):
         self._model = BARTModelWrapper()
-        # self._simcse = AutoModel.from_pretrained("")
-        self._simcse_model = AutoModel.from_pretrained("/princeton-nlp/unsup-simcse-roberta-large").cuda()
-        self._simcse_tokenizer = AutoTokenizer.from_pretrained("/princeton-nlp/unsup-simcse-roberta-large")
         self._optimizer = None
         self._lr_scheduler = None
         self._global_step = 0
@@ -92,34 +91,41 @@ class BART:
         self._dataset[set_type] = []
         for src_text, tgt_text, tgt_relevance in zip(src_texts, tgt_texts, tgt_relevances):
             self._dataset[set_type].append(TextPairData(
-                src_text=src_text, tgt_text=tgt_text))
+                src_text=src_text, tgt_text=tgt_text, tgt_relevance=tgt_relevance))
 
     def train_epoch(self, batch_size, noise_vocab, tgt_vocab):
         assert 'train' in self._dataset
         self.get_seq2seq_loss = self._get_seq2seq_loss_w_rel if tgt_vocab == "full" else self._get_seq2seq_loss
 
-        random.shuffle(self._dataset['train'])
+        # random.shuffle(self._dataset['train'])
         for i in trange(0, len(self._dataset['train']), batch_size,
                         desc='BART Training'):
-            self._model.split_to_gpus(2)
+            self._model.split_to_gpus(1)
             self._model.train()
 
             batch = self._dataset['train'][i:i + batch_size]
-
+            avg_loss_dict = {}
             self._optimizer.zero_grad()
 
             for example in batch:
                 noised_src_text = self._add_noise(example.src_text, noise_vocab)
 
-                loss = self.get_seq2seq_loss(
-                    src_text=noised_src_text, tgt_text=example.tgt_text)
-                loss = loss / batch_size
-                try_wandb_log({"train/loss":loss.detach().item()}, step=self._global_step)
-                loss.backward()
+                loss_dict = self.get_seq2seq_loss(
+                    src_text=noised_src_text, tgt_text=example.tgt_text, tgt_relevance=example.tgt_relevance)
+                
+                if not avg_loss_dict:
+                    avg_loss_dict = loss_dict
+                else:
+                    for k in avg_loss_dict.keys():
+                        avg_loss_dict[k] += (loss_dict[k] / batch_size)
+                
+            loss = avg_loss_dict.pop("loss") 
+            loss.backward()
+            avg_loss_dict["loss"] = loss.detach().cpu().item()
+            try_wandb_log(avg_loss_dict, step=self._global_step)
 
             self._optimizer.step()
             self._lr_scheduler.step()
-
             self._global_step += 1
             if self._global_step % self._eval_steps == 0:
                 self.gen_log()
@@ -129,15 +135,19 @@ class BART:
         self._model.split_to_gpus(1)
         self._model.eval()
 
-        loss_list = []
+        ce_loss_list, rel_loss_list, loss_list = [], [], []
         for example in tqdm(self._dataset['valid'], desc='Evaluating'):
             with torch.no_grad():
-                loss = self._get_seq2seq_loss(
+                loss_dict = self.get_seq2seq_loss(
                     src_text=example.src_text, tgt_text=example.tgt_text)
 
-            loss_list.append(loss.item())
+            ce_loss_list.append(loss_dict.get("ce_loss", 100))
+            rel_loss_list.append(loss_dict.get("rel_loss", 100))
+            loss_list.append(loss_dict.get("loss", 100))
 
-        return sum(loss_list) / len(loss_list)
+        return {"valid/ce_loss" : sum(ce_loss_list) / len(ce_loss_list),
+                "valid/rel_loss" : sum(rel_loss_list) / len(rel_loss_list),
+                "valid/loss" : sum(loss_list) / len(loss_list)}
 
     def generate(self, cond, top_k, top_p):
         self._model.split_to_gpus(1)
@@ -167,13 +177,14 @@ class BART:
         print(f'Global Step: {self._global_step}, Eval Loss: {eval_loss}',
               file=self._log_file)
         
-
-        if eval_loss < self._best_dev_loss:
-            self._best_dev_loss = eval_loss
+        _eval_loss = eval_loss.get("valid/loss",100)
+        if _eval_loss < self._best_dev_loss:
+            self._best_dev_loss = _eval_loss
             self.save_model(f'{self._log_dir}/best_model.pt')
             print('Best Model Updated.', file=self._log_file)
 
-        try_wandb_log({"dev/loss":eval_loss, 'dev/best_loss':self._best_dev_loss}, step=self._global_step)
+        try_wandb_log({'valid/best_loss':self._best_dev_loss}, step=self._global_step)
+        try_wandb_log(eval_loss, step=self._global_step)
         self._log_file.flush()
 
         generation_file = open(
@@ -207,30 +218,18 @@ class BART:
         # Flatten the tokens
         criterion = torch.nn.CrossEntropyLoss(
             ignore_index=self._model.dictionary.pad())
-        loss = criterion(
+        ce_loss = criterion(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        return loss
+        return {"ce_loss": ce_loss.detach().cpu().item(), "loss" : ce_loss}
     
-    def _get_seq2seq_loss_w_rel(self, src_text , tgt_text, method:str = "direct"):
+    def _get_seq2seq_loss_w_rel(self, src_text , tgt_text, tgt_relevance, method:str = "direct"):
         '''
         tgt_relevance(Dict[str, float]) : 어디에서 어디까지(key, i.e. 0-14)가 relevance가 얼마인지(value) 정보를 가지고 있음.
         method(str, either "direct" or "mmd") : 각 시퀀스의 relevance 정보를 이용해서 직접 최적화할지, 아니면 MMD로 loosly 최적화할지 선택. 
         '''
         # compute relevance of simcse on-the-fly
-        try:
-            prompt = src_text.split(' [SEP] ')[0]
-        except:
-            pass
-        tgt_relevance = {}
-        offset = 0
-        for sent in sent_tokenize(src_text): # sent_tokenize strips all \n\n
-            _len = self._model.encode(sent).size(-1)-2 # exclude </s> and <s>
-            if offset + _len > BART_MAX_LEN: break
-            tgt_relevance[f"{offset}-{offset+_len}"] = compute_sim_score(self._simcse_model,self._simcse_tokenizer, prompt, sent)
-            offset += (_len + 2) # +2 because of \n\n
         
-
         src_tokens = self._model.encode(src_text)[:BART_MAX_LEN].unsqueeze(0)
         tgt_tokens = self._model.encode(tgt_text)[:BART_MAX_LEN].unsqueeze(0)
 
@@ -248,26 +247,23 @@ class BART:
         # Flatten the tokens
         criterion = torch.nn.CrossEntropyLoss(
             ignore_index=self._model.dictionary.pad())
-        loss = criterion(
+        ce_loss = criterion(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         ### relevance distribution matching loss ###
         assert method == "direct" 
-        z_p = extra["last_encoder_hidden"].mean(dim=1)
-        z_s = extra["last_decoder_hidden"]
-        rel_losses = []
+        z_p = extra["last_encoder_hidden"].mean(dim=0).squeeze() # 1024
+        z_s = extra["decoder_last_hidden"].squeeze() # seq_len x 1024
+        rel_losses = torch.tensor(0.).cuda()
         # for idx, item in enumerate(tgt_relevance):
         for pos, val in tgt_relevance.items():
             start, end = map(int, pos.split("-"))
-            z_si = z_s[0, start:end].mean(dim=1)
-            val = float(val)
+            z_si = z_s[start:end].mean(dim=0) # 1024
+            val = torch.tensor(val)
             _mse_loss = (val - z_p.dot(z_si)/torch.norm(z_p)/torch.norm(z_si)).pow(2)
-            rel_losses.append(_mse_loss)
-        rel_losses = torch.cat(rel_losses).mean()
-
-        loss += 0.1*rel_losses
-
-        return loss
+            rel_losses += _mse_loss
+        rel_losses /= len(tgt_relevance)
+        return {"rel_loss":rel_losses.detach().cpu().item(), "ce_loss": ce_loss.detach().cpu().item(), "loss" : ce_loss+REL_MIXING_COEFF*rel_losses}
 
     def _add_noise(self, text, noise_vocab):
         if text.find(' [SEP] ') == -1:
